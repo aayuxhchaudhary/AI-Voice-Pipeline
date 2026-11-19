@@ -48,7 +48,8 @@ class PipelineConfig:
 
     input_device: int | None = None
     output_device: int | None = None
-    voice_barge_in: bool = False
+    voice_barge_in: bool = True
+    silence_timeout_ms: int = 800
 
     websocket_base_url: str = (
         "wss://generativelanguage.googleapis.com/ws/"
@@ -85,7 +86,9 @@ class PipelineConfig:
 
         input_device = int(input_device_env) if input_device_env.isdigit() else None
         output_device = int(output_device_env) if output_device_env.isdigit() else None
-        voice_barge_in = os.getenv("VOICE_BARGE_IN", "false").strip().lower() in ("true", "1", "yes")
+        voice_barge_in = os.getenv("VOICE_BARGE_IN", "true").strip().lower() in ("true", "1", "yes")
+        silence_timeout_env = os.getenv("SILENCE_TIMEOUT_MS", "800").strip()
+        silence_timeout_ms = int(silence_timeout_env) if silence_timeout_env.isdigit() else 800
 
         return cls(
             api_key=api_key,
@@ -95,4 +98,5 @@ class PipelineConfig:
             input_device=input_device,
             output_device=output_device,
             voice_barge_in=voice_barge_in,
+            silence_timeout_ms=silence_timeout_ms,
         )

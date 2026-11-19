@@ -56,12 +56,12 @@ def list_devices() -> None:
 
 def print_banner(config: PipelineConfig) -> None:
     model_name = config.model_id.replace("models/", "")
-    barge_mode = "Voice & Enter" if config.voice_barge_in else "Enter key"
     print(
         f"\n┌─ Voice Pipeline\n"
         f"│  model    : {model_name} ({config.voice_name})\n"
         f"│  stream   : {config.input_sample_rate // 1000}kHz in · {config.output_sample_rate // 1000}kHz out\n"
-        f"│  barge-in : {barge_mode}\n"
+        f"│  gap      : {config.silence_timeout_ms}ms pause allowed (Enter to send instantly)\n"
+        f"│  barge-in : Voice & Enter\n"
         f"└─ status   : listening (Ctrl+C to exit)\n"
     )
 
@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", type=str, default=None, help="Path to .env file")
     parser.add_argument("--voice", type=str, default=None, help="Voice name (Kore, Puck, Charon, Aoede, Fenrir)")
     parser.add_argument("--model", type=str, default=None, help="Gemini model ID")
+    parser.add_argument("--silence-timeout", type=int, default=None, help="Silence gap timeout in ms (default: 800)")
     parser.add_argument("--voice-barge-in", action="store_true", help="Enable acoustic voice barge-in (recommended with earphones)")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
@@ -96,6 +97,8 @@ def main() -> None:
         config = replace(config, voice_name=args.voice)
     if args.model:
         config = replace(config, model_id=args.model)
+    if args.silence_timeout is not None:
+        config = replace(config, silence_timeout_ms=args.silence_timeout)
     if args.voice_barge_in:
         config = replace(config, voice_barge_in=True)
 

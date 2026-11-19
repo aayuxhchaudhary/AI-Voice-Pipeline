@@ -39,6 +39,7 @@ class VoicePipeline:
         self._running = False
         self._interrupted = False
         self._force_listening = False
+        self._force_commit = False
         self._awaiting_response = False
 
     async def run(self) -> None:
@@ -77,6 +78,8 @@ class VoicePipeline:
             self.audio_out.flush()
             self._force_listening = True
             self._awaiting_response = False
+        else:
+            self._force_commit = True
 
     async def _receiver_loop(self) -> None:
         has_printed_header = False
@@ -129,38 +132,43 @@ class VoicePipeline:
         speech_chunks = 0
         barge_in_chunks = 0
         min_speech_chunks = 2
-        silence_limit_chunks = 10  # 300ms pause to commit turn
+        was_playing = False
+
+        chunk_ms = (self.config.input_chunk_size / self.config.input_sample_rate) * 1000.0
+        silence_limit_chunks = max(10, int(round(self.config.silence_timeout_ms / chunk_ms)))
 
         noise_floor = 30.0
         calibration_samples = 0
-        awaiting_response_chunks = 0
 
         while self._running:
             chunk = await self.audio_in.read()
             if not chunk:
                 continue
 
-            if self._awaiting_response:
-                awaiting_response_chunks += 1
-                if awaiting_response_chunks > 100:
-                    self._awaiting_response = False
-                    awaiting_response_chunks = 0
-                continue
-            awaiting_response_chunks = 0
+            # Detect transition: assistant finished speaking -> prompt user that mic is ready
+            currently_playing = self.audio_out.is_playing
+            if was_playing and not currently_playing:
+                if not is_speaking and not self._awaiting_response:
+                    print("\n[You]: Listening...", end="", flush=True)
+            was_playing = currently_playing
 
             samples = np.frombuffer(chunk, dtype=np.int16)
             samples_clean = samples - int(np.mean(samples))
             rms = float(np.sqrt(np.mean(samples_clean.astype(np.float32) ** 2)))
 
-            if calibration_samples < 20:
+            # Initial calibration of ambient noise floor (first 450ms)
+            if calibration_samples < 15:
                 noise_floor = (noise_floor * calibration_samples + rms) / (calibration_samples + 1)
                 calibration_samples += 1
                 preroll.append(chunk)
                 continue
 
-            # Continuous noise floor adaptation during non-speech:
-            if not is_speaking and rms < noise_floor * 1.4:
-                noise_floor = 0.96 * noise_floor + 0.04 * rms
+            # Adaptive noise floor tracking during quiet periods
+            if not is_speaking and not currently_playing and not self._awaiting_response:
+                if rms < noise_floor * 1.3:
+                    noise_floor = 0.95 * noise_floor + 0.05 * rms
+                elif rms < noise_floor * 1.8:
+                    noise_floor = 0.998 * noise_floor + 0.002 * rms
 
             # WebRTC VAD Mode 3 on clean un-boosted samples (filters fan/ambient noise)
             is_speech_frame = False
@@ -171,11 +179,26 @@ class VoicePipeline:
                     is_speech_frame = False
 
             # Speech requires vocal formants AND energy above ambient noise
-            speech_energy_thresh = max(45.0, noise_floor * 1.3)
+            speech_energy_thresh = max(40.0, noise_floor * 1.25 + 15.0)
             has_speech = is_speech_frame and (rms > speech_energy_thresh)
 
-            # Silence condition: energy drops back to ambient noise OR VAD detects no speech
-            is_silence = not has_speech or (rms < noise_floor * 1.35 + 10.0)
+            # While awaiting assistant response, suppress noise; allow fast override if user talks
+            if self._awaiting_response:
+                if has_speech:
+                    speech_chunks += 1
+                    if speech_chunks >= 3:
+                        self._awaiting_response = False
+                        is_speaking = True
+                        buffer.clear()
+                        for p in preroll:
+                            buffer.extend(p)
+                        buffer.extend(chunk)
+                        preroll.clear()
+                        print("\n[You]: Listening...", end="", flush=True)
+                else:
+                    speech_chunks = 0
+                preroll.append(chunk)
+                continue
 
             # Manual Hotkey Interrupt (<Enter>)
             if self._force_listening:
@@ -187,33 +210,32 @@ class VoicePipeline:
                 preroll.clear()
 
             # --- Playback Active (Assistant Speaking) ---
-            if self.audio_out.is_playing:
-                # If voice barge-in is enabled (e.g. headphones):
-                if self.config.voice_barge_in:
-                    barge_thresh = max(600.0, noise_floor * 3.5)
-                    if has_speech and rms > barge_thresh:
-                        barge_in_chunks += 1
-                        if barge_in_chunks >= 2 and not self._interrupted:
-                            self._interrupted = True
-                            print("\n[Barge-in] Interrupted assistant.")
-                            print("\n[You]: Listening...", end="", flush=True)
-                            self.audio_out.flush()
+            if currently_playing:
+                # If PipeWire Echo-Cancel Source + Sink are paired, speaker output is cancelled
+                if self.audio_in._is_echo_cancel and self.audio_out._is_echo_cancel:
+                    barge_thresh = max(45.0, noise_floor * 1.30 + 15.0)
+                else:
+                    barge_thresh = max(350.0, noise_floor * 2.5)
 
-                            buffer.clear()
-                            for p in preroll:
-                                buffer.extend(p)
-                            buffer.extend(chunk)
-                            preroll.clear()
+                if has_speech and rms > barge_thresh:
+                    barge_in_chunks += 1
+                    if barge_in_chunks >= 2 and not self._interrupted:
+                        self._interrupted = True
+                        print("\n[Barge-in] Interrupted assistant.")
+                        print("\n[You]: Listening...", end="", flush=True)
+                        self.audio_out.flush()
 
-                            is_speaking = True
-                            speech_chunks = min_speech_chunks
-                            silence_chunks = 0
-                            barge_in_chunks = 0
-                    else:
+                        buffer.clear()
+                        for p in preroll:
+                            buffer.extend(p)
+                        buffer.extend(chunk)
+                        preroll.clear()
+
+                        is_speaking = True
+                        speech_chunks = min_speech_chunks
+                        silence_chunks = 0
                         barge_in_chunks = 0
                 else:
-                    # Echo-Guard active: mic ignores speaker output to prevent self-interruption.
-                    # User presses <Enter> to interrupt instantly!
                     barge_in_chunks = 0
                 continue
 
@@ -237,30 +259,40 @@ class VoicePipeline:
                     buffer.extend(chunk)
                     silence_chunks = 0
             else:
-                if is_speaking:
+                if not is_speaking:
+                    speech_chunks = 0
+                else:
                     buffer.extend(chunk)
-                    if is_silence:
-                        silence_chunks += 1
+                    silence_chunks += 1
 
-                    # Commit condition: 300ms silence OR max duration (10s) reached
-                    max_duration_reached = len(buffer) >= (self.config.input_sample_rate * 2 * 10)
-                    if silence_chunks >= silence_limit_chunks or max_duration_reached:
+                    # Commit condition: silence timeout reached, max duration reached, or user pressed Enter
+                    max_duration_reached = len(buffer) >= (self.config.input_sample_rate * 2 * 20)
+                    force_commit = self._force_commit
+                    self._force_commit = False
+
+                    if silence_chunks >= silence_limit_chunks or max_duration_reached or force_commit:
                         is_speaking = False
                         speech_chunks = 0
                         silence_chunks = 0
 
                         duration_sec = len(buffer) / (self.config.input_sample_rate * 2)
-                        if duration_sec < 0.30:
+                        if duration_sec < 0.20:
                             buffer.clear()
                             continue
 
-                        raw_pcm = bytes(buffer)
+                        # Trim trailing silence buffer so Gemini receives utterance without dead silence lag
+                        trim_chunks = max(0, silence_chunks - 4)
+                        trim_bytes = trim_chunks * len(chunk)
+                        if len(buffer) > trim_bytes + 3200:
+                            raw_pcm = bytes(buffer[:-trim_bytes])
+                        else:
+                            raw_pcm = bytes(buffer)
                         buffer.clear()
 
                         samples_out = np.frombuffer(raw_pcm, dtype=np.int16)
                         peak = float(np.max(np.abs(samples_out)))
                         if 0 < peak < 20000:
-                            gain = min(24000.0 / peak, 5.0)
+                            gain = min(24000.0 / peak, 4.0)
                             boosted = np.clip(samples_out.astype(np.float32) * gain, -32767, 32767).astype(np.int16)
                             utterance = boosted.tobytes()
                         else:
