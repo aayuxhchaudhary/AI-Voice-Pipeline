@@ -55,6 +55,20 @@ class Protocol:
         })
 
     @staticmethod
+    def text_turn_payload(text: str) -> str:
+        return json.dumps({
+            "clientContent": {
+                "turns": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": text}],
+                    }
+                ],
+                "turnComplete": True,
+            }
+        })
+
+    @staticmethod
     def parse(raw_text: str) -> tuple[list[bytes], list[str], bool, bool]:
         try:
             data = json.loads(raw_text)
@@ -119,6 +133,11 @@ class LiveClient:
     async def send_turn(self, pcm_bytes: bytes) -> None:
         if self.ws is not None and pcm_bytes:
             payload = Protocol.audio_turn_payload(pcm_bytes, self.config.input_sample_rate)
+            await self.ws.send(payload)
+
+    async def send_text_turn(self, text: str) -> None:
+        if self.ws is not None and text.strip():
+            payload = Protocol.text_turn_payload(text.strip())
             await self.ws.send(payload)
 
     async def recv(self) -> tuple[list[bytes], list[str], bool, bool]:

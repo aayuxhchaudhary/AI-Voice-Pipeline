@@ -40,37 +40,53 @@ class VoicePipeline:
         self._interrupted = False
         self._force_listening = False
         self._force_commit = False
+        self._is_speaking = False
         self._awaiting_response = False
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
-        self.audio_in.start(loop)
-        self.audio_out.start()
         self._running = True
 
-        try:
-            loop.add_reader(sys.stdin.fileno(), self._on_stdin_activity)
-        except Exception:
-            pass
-
-        try:
-            await self.client.connect()
-            await asyncio.gather(
-                self._mic_loop(),
-                self._receiver_loop(),
-            )
-        finally:
+        if self.config.text_mode:
+            self.audio_out.start()
             try:
-                loop.remove_reader(sys.stdin.fileno())
+                await self.client.connect()
+                await asyncio.gather(
+                    self._text_loop(),
+                    self._receiver_loop(),
+                )
+            finally:
+                await self.stop()
+        else:
+            self.audio_in.start(loop)
+            self.audio_out.start()
+
+            try:
+                loop.add_reader(sys.stdin.fileno(), self._on_stdin_activity)
             except Exception:
                 pass
-            await self.stop()
+
+            try:
+                await self.client.connect()
+                await asyncio.gather(
+                    self._mic_loop(),
+                    self._receiver_loop(),
+                )
+            finally:
+                try:
+                    loop.remove_reader(sys.stdin.fileno())
+                except Exception:
+                    pass
+                await self.stop()
 
     def _on_stdin_activity(self) -> None:
         try:
-            sys.stdin.readline()
+            line = sys.stdin.readline()
+            if not line:
+                return
         except Exception:
             return
+
         if self.audio_out.is_playing and not self._interrupted:
             self._interrupted = True
             print("\n[Barge-in] Interrupted assistant.")
@@ -78,8 +94,34 @@ class VoicePipeline:
             self.audio_out.flush()
             self._force_listening = True
             self._awaiting_response = False
-        else:
+        elif self._is_speaking:
             self._force_commit = True
+
+    async def _text_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        print("\nType your message below (or press Enter while assistant speaks to barge in):")
+        while self._running:
+            try:
+                user_input = await loop.run_in_executor(None, input, "\n[You]: ")
+            except (EOFError, asyncio.CancelledError):
+                break
+            except Exception:
+                break
+
+            user_text = user_input.strip()
+            if not user_text:
+                if self.audio_out.is_playing and not self._interrupted:
+                    self._interrupted = True
+                    print("\n[Barge-in] Interrupted assistant.")
+                    self.audio_out.flush()
+                continue
+
+            if self.audio_out.is_playing:
+                self._interrupted = True
+                self.audio_out.flush()
+
+            self._awaiting_response = True
+            await self.client.send_text_turn(user_text)
 
     async def _receiver_loop(self) -> None:
         has_printed_header = False
@@ -130,6 +172,7 @@ class VoicePipeline:
         is_speaking = False
         silence_chunks = 0
         speech_chunks = 0
+        total_speech_chunks = 0
         barge_in_chunks = 0
         min_speech_chunks = 2
         was_playing = False
@@ -182,13 +225,15 @@ class VoicePipeline:
             speech_energy_thresh = max(40.0, noise_floor * 1.25 + 15.0)
             has_speech = is_speech_frame and (rms > speech_energy_thresh)
 
-            # While awaiting assistant response, suppress noise; allow fast override if user talks
+            # While awaiting assistant response, suppress noise; allow fast override only on confident speech
             if self._awaiting_response:
-                if has_speech:
+                if has_speech and rms > (noise_floor * 2.0 + 30.0):
                     speech_chunks += 1
-                    if speech_chunks >= 3:
+                    if speech_chunks >= 5:
                         self._awaiting_response = False
                         is_speaking = True
+                        self._is_speaking = True
+                        total_speech_chunks = speech_chunks
                         buffer.clear()
                         for p in preroll:
                             buffer.extend(p)
@@ -204,7 +249,9 @@ class VoicePipeline:
             if self._force_listening:
                 self._force_listening = False
                 is_speaking = True
+                self._is_speaking = True
                 speech_chunks = min_speech_chunks
+                total_speech_chunks = min_speech_chunks
                 silence_chunks = 0
                 buffer.clear()
                 preroll.clear()
@@ -213,13 +260,13 @@ class VoicePipeline:
             if currently_playing:
                 # If PipeWire Echo-Cancel Source + Sink are paired, speaker output is cancelled
                 if self.audio_in._is_echo_cancel and self.audio_out._is_echo_cancel:
-                    barge_thresh = max(45.0, noise_floor * 1.30 + 15.0)
+                    barge_thresh = max(50.0, noise_floor * 1.35 + 20.0)
                 else:
                     barge_thresh = max(350.0, noise_floor * 2.5)
 
                 if has_speech and rms > barge_thresh:
                     barge_in_chunks += 1
-                    if barge_in_chunks >= 2 and not self._interrupted:
+                    if barge_in_chunks >= 3 and not self._interrupted:
                         self._interrupted = True
                         print("\n[Barge-in] Interrupted assistant.")
                         print("\n[You]: Listening...", end="", flush=True)
@@ -232,7 +279,9 @@ class VoicePipeline:
                         preroll.clear()
 
                         is_speaking = True
+                        self._is_speaking = True
                         speech_chunks = min_speech_chunks
+                        total_speech_chunks = barge_in_chunks
                         silence_chunks = 0
                         barge_in_chunks = 0
                 else:
@@ -249,6 +298,7 @@ class VoicePipeline:
                 speech_chunks += 1
                 if speech_chunks >= min_speech_chunks and not is_speaking:
                     is_speaking = True
+                    self._is_speaking = True
                     buffer.clear()
                     for p in preroll:
                         buffer.extend(p)
@@ -256,6 +306,7 @@ class VoicePipeline:
                     print("\n[You]: Listening...", end="", flush=True)
 
                 if is_speaking:
+                    total_speech_chunks += 1
                     buffer.extend(chunk)
                     silence_chunks = 0
             else:
@@ -267,21 +318,30 @@ class VoicePipeline:
 
                     # Commit condition: silence timeout reached, max duration reached, or user pressed Enter
                     max_duration_reached = len(buffer) >= (self.config.input_sample_rate * 2 * 20)
-                    force_commit = self._force_commit
+                    force_commit = self._force_commit and is_speaking and len(buffer) >= 3200
                     self._force_commit = False
 
                     if silence_chunks >= silence_limit_chunks or max_duration_reached or force_commit:
                         is_speaking = False
-                        speech_chunks = 0
+                        self._is_speaking = False
+                        saved_silence = silence_chunks
+                        saved_speech = total_speech_chunks
                         silence_chunks = 0
+                        speech_chunks = 0
+                        total_speech_chunks = 0
+
+                        # Discard transient noise bursts / fan fluctuations (must contain at least 4 speech frames)
+                        if saved_speech < 4 and not force_commit:
+                            buffer.clear()
+                            continue
 
                         duration_sec = len(buffer) / (self.config.input_sample_rate * 2)
-                        if duration_sec < 0.20:
+                        if duration_sec < 0.25 and not force_commit:
                             buffer.clear()
                             continue
 
                         # Trim trailing silence buffer so Gemini receives utterance without dead silence lag
-                        trim_chunks = max(0, silence_chunks - 4)
+                        trim_chunks = max(0, saved_silence - 4)
                         trim_bytes = trim_chunks * len(chunk)
                         if len(buffer) > trim_bytes + 3200:
                             raw_pcm = bytes(buffer[:-trim_bytes])
@@ -289,7 +349,13 @@ class VoicePipeline:
                             raw_pcm = bytes(buffer)
                         buffer.clear()
 
+                        if len(raw_pcm) == 0:
+                            continue
+
                         samples_out = np.frombuffer(raw_pcm, dtype=np.int16)
+                        if len(samples_out) == 0:
+                            continue
+
                         peak = float(np.max(np.abs(samples_out)))
                         if 0 < peak < 20000:
                             gain = min(24000.0 / peak, 4.0)
