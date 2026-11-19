@@ -10,18 +10,12 @@ from dataclasses import replace
 from pathlib import Path
 
 _root = Path(__file__).resolve().parent
-_venv_candidates = [
-    _root / ".venv" / "bin" / "python",
-    _root / ".venv" / "Scripts" / "python.exe",
-    _root / "venv" / "bin" / "python",
-    _root / "venv" / "Scripts" / "python.exe",
-]
-for _cand in _venv_candidates:
-    if _cand.is_file() and Path(sys.executable).resolve() != _cand.resolve():
-        try:
-            os.execv(str(_cand), [str(_cand)] + sys.argv)
-        except OSError:
-            pass
+_cand = _root / ".venv" / "bin" / "python"
+if _cand.is_file() and Path(sys.executable).resolve() != _cand.resolve():
+    try:
+        os.execv(str(_cand), [str(_cand)] + sys.argv)
+    except OSError:
+        pass
 
 sys.path.insert(0, str(_root / "src"))
 
@@ -32,9 +26,8 @@ from voice_pipeline.pipeline import VoicePipeline
 
 
 def setup_logging(verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=level,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
@@ -82,7 +75,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voice", type=str, default=None, help="Voice name (Kore, Puck, Charon, Aoede, Fenrir)")
     parser.add_argument("--model", type=str, default=None, help="Gemini model ID")
     parser.add_argument("--silence-timeout", type=int, default=None, help="Silence gap timeout in ms (default: 900)")
-    parser.add_argument("--voice-barge-in", action="store_true", help="Enable acoustic voice barge-in (recommended with earphones)")
     parser.add_argument(
         "--no-mic",
         "--text-mode",
@@ -116,8 +108,6 @@ def main() -> None:
         config = replace(config, model_id=args.model)
     if args.silence_timeout is not None:
         config = replace(config, silence_timeout_ms=args.silence_timeout)
-    if args.voice_barge_in:
-        config = replace(config, voice_barge_in=True)
     if args.text_mode:
         config = replace(config, text_mode=True)
 

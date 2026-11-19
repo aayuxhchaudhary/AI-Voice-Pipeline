@@ -132,13 +132,11 @@ class LiveClient:
 
     async def send_turn(self, pcm_bytes: bytes) -> None:
         if self.ws is not None and pcm_bytes:
-            payload = Protocol.audio_turn_payload(pcm_bytes, self.config.input_sample_rate)
-            await self.ws.send(payload)
+            await self.ws.send(Protocol.audio_turn_payload(pcm_bytes, self.config.input_sample_rate))
 
     async def send_text_turn(self, text: str) -> None:
         if self.ws is not None and text.strip():
-            payload = Protocol.text_turn_payload(text.strip())
-            await self.ws.send(payload)
+            await self.ws.send(Protocol.text_turn_payload(text.strip()))
 
     async def recv(self) -> tuple[list[bytes], list[str], bool, bool]:
         if self.ws is None:

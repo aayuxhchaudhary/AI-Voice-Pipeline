@@ -38,7 +38,6 @@ class VoicePipeline:
         self.vad = webrtcvad.Vad(3) if _HAS_WEBRTC_VAD else None
         self._running = False
         self._interrupted = False
-        self._force_listening = False
         self._force_commit = False
         self._is_speaking = False
         self._awaiting_response = False
@@ -92,7 +91,6 @@ class VoicePipeline:
             print("\n[Barge-in] Interrupted assistant.")
             print("\n[You]: Listening...", end="", flush=True)
             self.audio_out.flush()
-            self._force_listening = True
             self._awaiting_response = False
         elif self._is_speaking:
             self._force_commit = True
@@ -188,44 +186,38 @@ class VoicePipeline:
             if not chunk:
                 continue
 
-            # Detect transition: assistant finished speaking -> prompt user that mic is ready
             currently_playing = self.audio_out.is_playing
             if was_playing and not currently_playing:
                 if not is_speaking and not self._awaiting_response:
                     print("\n[You]: Listening...", end="", flush=True)
             was_playing = currently_playing
 
-            samples = np.frombuffer(chunk, dtype=np.int16)
-            samples_clean = samples - int(np.mean(samples))
-            rms = float(np.sqrt(np.mean(samples_clean.astype(np.float32) ** 2)))
+            s = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+            s -= s.mean()
+            rms = float(np.sqrt(np.mean(s * s)))
 
-            # Initial calibration of ambient noise floor (first 450ms)
             if calibration_samples < 15:
                 noise_floor = (noise_floor * calibration_samples + rms) / (calibration_samples + 1)
                 calibration_samples += 1
                 preroll.append(chunk)
                 continue
 
-            # Adaptive noise floor tracking during quiet periods
             if not is_speaking and not currently_playing and not self._awaiting_response:
                 if rms < noise_floor * 1.3:
                     noise_floor = 0.95 * noise_floor + 0.05 * rms
                 elif rms < noise_floor * 1.8:
                     noise_floor = 0.998 * noise_floor + 0.002 * rms
 
-            # WebRTC VAD Mode 3 on clean un-boosted samples (filters fan/ambient noise)
             is_speech_frame = False
             if self.vad is not None and len(chunk) == 960:
                 try:
-                    is_speech_frame = self.vad.is_speech(samples_clean.tobytes(), self.config.input_sample_rate)
+                    is_speech_frame = self.vad.is_speech(chunk, self.config.input_sample_rate)
                 except Exception:
                     is_speech_frame = False
 
-            # Speech requires vocal formants AND energy above ambient noise
             speech_energy_thresh = max(40.0, noise_floor * 1.25 + 15.0)
             has_speech = is_speech_frame and (rms > speech_energy_thresh)
 
-            # While awaiting assistant response, suppress noise; allow fast override only on confident speech
             if self._awaiting_response:
                 if has_speech and rms > (noise_floor * 2.0 + 30.0):
                     speech_chunks += 1
@@ -245,20 +237,7 @@ class VoicePipeline:
                 preroll.append(chunk)
                 continue
 
-            # Manual Hotkey Interrupt (<Enter>)
-            if self._force_listening:
-                self._force_listening = False
-                is_speaking = True
-                self._is_speaking = True
-                speech_chunks = min_speech_chunks
-                total_speech_chunks = min_speech_chunks
-                silence_chunks = 0
-                buffer.clear()
-                preroll.clear()
-
-            # --- Playback Active (Assistant Speaking) ---
             if currently_playing:
-                # If PipeWire Echo-Cancel Source + Sink are paired, speaker output is cancelled
                 if self.audio_in._is_echo_cancel and self.audio_out._is_echo_cancel:
                     barge_thresh = max(50.0, noise_floor * 1.35 + 20.0)
                 else:
@@ -290,7 +269,6 @@ class VoicePipeline:
 
             barge_in_chunks = 0
 
-            # Pre-roll buffer during silence
             if not is_speaking:
                 preroll.append(chunk)
 
@@ -316,7 +294,6 @@ class VoicePipeline:
                     buffer.extend(chunk)
                     silence_chunks += 1
 
-                    # Commit condition: silence timeout reached, max duration reached, or user pressed Enter
                     max_duration_reached = len(buffer) >= (self.config.input_sample_rate * 2 * 20)
                     force_commit = self._force_commit and is_speaking and len(buffer) >= 3200
                     self._force_commit = False
@@ -330,7 +307,6 @@ class VoicePipeline:
                         speech_chunks = 0
                         total_speech_chunks = 0
 
-                        # Discard transient noise bursts / fan fluctuations (must contain at least 4 speech frames)
                         if saved_speech < 4 and not force_commit:
                             buffer.clear()
                             continue
@@ -340,7 +316,6 @@ class VoicePipeline:
                             buffer.clear()
                             continue
 
-                        # Trim trailing silence buffer so Gemini receives utterance without dead silence lag
                         trim_chunks = max(0, saved_silence - 4)
                         trim_bytes = trim_chunks * len(chunk)
                         if len(buffer) > trim_bytes + 3200:
