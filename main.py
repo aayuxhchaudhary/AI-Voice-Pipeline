@@ -24,17 +24,22 @@ import sounddevice as sd
 from voice_pipeline.config import PipelineConfig
 from voice_pipeline.pipeline import VoicePipeline
 
+USE_COLOR = sys.stdout.isatty()
+GREEN = "\033[32m" if USE_COLOR else ""
+DIM = "\033[2m" if USE_COLOR else ""
+RESET = "\033[0m" if USE_COLOR else ""
+
 
 def setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
+        level=logging.DEBUG if verbose else logging.WARNING,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
 
 
 def list_devices() -> None:
-    print("\n--- Audio Devices ---")
+    print("\nAudio Devices:")
     for idx, dev in enumerate(sd.query_devices()):
         in_ch = dev.get("max_input_channels", 0)
         out_ch = dev.get("max_output_channels", 0)
@@ -43,30 +48,13 @@ def list_devices() -> None:
             markers.append(f"In: {in_ch}ch")
         if out_ch > 0:
             markers.append(f"Out: {out_ch}ch")
-        print(f"[{idx:2d}] {dev.get('name')} ({', '.join(markers)})")
-    print("---------------------\n")
+        print(f"  [{idx:2d}] {dev.get('name')} ({', '.join(markers)})")
+    print()
 
 
 def print_banner(config: PipelineConfig) -> None:
-    model_name = config.model_id.replace("models/", "")
-    if config.text_mode:
-        print(
-            f"\n┌─ Voice Pipeline (Text Input Mode)\n"
-            f"│  model    : {model_name} ({config.voice_name})\n"
-            f"│  input    : Keyboard / Console (no microphone used)\n"
-            f"│  output   : {config.output_sample_rate // 1000}kHz speaker audio\n"
-            f"│  barge-in : Enter / type while assistant speaks\n"
-            f"└─ status   : ready (Ctrl+C to exit)\n"
-        )
-    else:
-        print(
-            f"\n┌─ Voice Pipeline (Microphone Mode)\n"
-            f"│  model    : {model_name} ({config.voice_name})\n"
-            f"│  stream   : {config.input_sample_rate // 1000}kHz in · {config.output_sample_rate // 1000}kHz out\n"
-            f"│  gap      : {config.silence_timeout_ms}ms pause allowed (Enter to send instantly)\n"
-            f"│  barge-in : Voice & Enter\n"
-            f"└─ status   : listening (Ctrl+C to exit)\n"
-        )
+    mode_str = "Text mode" if config.text_mode else "Ready"
+    print(f"\n{GREEN}●{RESET} Gemini Live ({config.voice_name}) · {DIM}{mode_str} (Ctrl+C to exit){RESET}\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         help="Run in interactive text input mode (no microphone used)",
     )
     parser.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
 
@@ -99,7 +87,7 @@ def main() -> None:
     try:
         config = PipelineConfig.from_env(args.env_file)
     except ValueError as e:
-        print(f"\n[Configuration Error] {e}\n", file=sys.stderr)
+        print(f"\nConfiguration Error: {e}\n", file=sys.stderr)
         sys.exit(1)
 
     if args.voice:
@@ -132,10 +120,13 @@ def main() -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     except PermissionError as e:
-        print(f"\n[Authentication Error] {e}\n", file=sys.stderr)
+        print(f"\nAuthentication Error: {e}\n", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        logging.error("Fatal pipeline error: %s", e)
+        if args.verbose:
+            logging.error("Fatal error: %s", e)
+        else:
+            print(f"\nError: {e}\n", file=sys.stderr)
         sys.exit(1)
     finally:
         try:
@@ -143,7 +134,7 @@ def main() -> None:
         except Exception:
             pass
         loop.close()
-        print("\nPipeline shut down successfully.\n")
+        print(f"\n{DIM}Disconnected.{RESET}\n")
 
 
 if __name__ == "__main__":
