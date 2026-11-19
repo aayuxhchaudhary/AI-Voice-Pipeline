@@ -1,4 +1,4 @@
-# AI Voice Pipeline 🎙️
+# AI Voice Pipeline 
 
 > **Universal, low-latency, cloud-orchestrated conversational voice AI pipeline powered by Gemini Live WebSockets.**
 
