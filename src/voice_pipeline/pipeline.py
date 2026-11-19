@@ -19,6 +19,12 @@ from voice_pipeline.config import PipelineConfig
 
 logger = logging.getLogger("voice_pipeline.pipeline")
 
+USE_COLOR = sys.stdout.isatty()
+GREEN = "\033[32m" if USE_COLOR else ""
+CYAN = "\033[36m" if USE_COLOR else ""
+DIM = "\033[2m" if USE_COLOR else ""
+RESET = "\033[0m" if USE_COLOR else ""
+
 
 class VoicePipeline:
     def __init__(self, config: PipelineConfig) -> None:
@@ -88,8 +94,7 @@ class VoicePipeline:
 
         if self.audio_out.is_playing and not self._interrupted:
             self._interrupted = True
-            print("\n[Barge-in] Interrupted assistant.")
-            print("\n[You]: Listening...", end="", flush=True)
+            print(f" {DIM}[interrupted]{RESET}\n")
             self.audio_out.flush()
             self._awaiting_response = False
         elif self._is_speaking:
@@ -97,10 +102,9 @@ class VoicePipeline:
 
     async def _text_loop(self) -> None:
         loop = asyncio.get_running_loop()
-        print("\nType your message below (or press Enter while assistant speaks to barge in):")
         while self._running:
             try:
-                user_input = await loop.run_in_executor(None, input, "\n[You]: ")
+                user_input = await loop.run_in_executor(None, input, f"{GREEN}You:{RESET} ")
             except (EOFError, asyncio.CancelledError):
                 break
             except Exception:
@@ -110,7 +114,7 @@ class VoicePipeline:
             if not user_text:
                 if self.audio_out.is_playing and not self._interrupted:
                     self._interrupted = True
-                    print("\n[Barge-in] Interrupted assistant.")
+                    print(f" {DIM}[interrupted]{RESET}\n")
                     self.audio_out.flush()
                 continue
 
@@ -147,13 +151,13 @@ class VoicePipeline:
 
                 for text in transcripts:
                     if not has_printed_header:
-                        print("\n[Gemini]: ", end="", flush=True)
+                        print(f"\n{CYAN}Gemini:{RESET} ", end="", flush=True)
                         has_printed_header = True
                     print(text, end="", flush=True)
 
                 if turn_complete:
                     if has_printed_header:
-                        print()
+                        print("\n")
                     has_printed_header = False
 
             except asyncio.CancelledError:
@@ -173,7 +177,6 @@ class VoicePipeline:
         total_speech_chunks = 0
         barge_in_chunks = 0
         min_speech_chunks = 2
-        was_playing = False
 
         chunk_ms = (self.config.input_chunk_size / self.config.input_sample_rate) * 1000.0
         silence_limit_chunks = max(10, int(round(self.config.silence_timeout_ms / chunk_ms)))
@@ -187,10 +190,6 @@ class VoicePipeline:
                 continue
 
             currently_playing = self.audio_out.is_playing
-            if was_playing and not currently_playing:
-                if not is_speaking and not self._awaiting_response:
-                    print("\n[You]: Listening...", end="", flush=True)
-            was_playing = currently_playing
 
             s = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
             s -= s.mean()
@@ -231,7 +230,7 @@ class VoicePipeline:
                             buffer.extend(p)
                         buffer.extend(chunk)
                         preroll.clear()
-                        print("\n[You]: Listening...", end="", flush=True)
+                        print(f"{GREEN}You:{RESET} ", end="", flush=True)
                 else:
                     speech_chunks = 0
                 preroll.append(chunk)
@@ -247,8 +246,7 @@ class VoicePipeline:
                     barge_in_chunks += 1
                     if barge_in_chunks >= 3 and not self._interrupted:
                         self._interrupted = True
-                        print("\n[Barge-in] Interrupted assistant.")
-                        print("\n[You]: Listening...", end="", flush=True)
+                        print(f" {DIM}[interrupted]{RESET}\n")
                         self.audio_out.flush()
 
                         buffer.clear()
@@ -263,6 +261,7 @@ class VoicePipeline:
                         total_speech_chunks = barge_in_chunks
                         silence_chunks = 0
                         barge_in_chunks = 0
+                        print(f"{GREEN}You:{RESET} ", end="", flush=True)
                 else:
                     barge_in_chunks = 0
                 continue
@@ -281,7 +280,7 @@ class VoicePipeline:
                     for p in preroll:
                         buffer.extend(p)
                     preroll.clear()
-                    print("\n[You]: Listening...", end="", flush=True)
+                    print(f"{GREEN}You:{RESET} ", end="", flush=True)
 
                 if is_speaking:
                     total_speech_chunks += 1
