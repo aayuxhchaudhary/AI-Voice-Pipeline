@@ -4,6 +4,15 @@ import asyncio
 import collections
 import logging
 import sys
+import time
+from dataclasses import replace
+
+try:
+    import termios
+    import tty
+    _HAS_TERMIOS = True
+except ImportError:
+    _HAS_TERMIOS = False
 
 import numpy as np
 
@@ -22,12 +31,23 @@ logger = logging.getLogger("voice_pipeline.pipeline")
 USE_COLOR = sys.stdout.isatty()
 GREEN = "\033[32m" if USE_COLOR else ""
 CYAN = "\033[36m" if USE_COLOR else ""
+RED = "\033[31m" if USE_COLOR else ""
 DIM = "\033[2m" if USE_COLOR else ""
 RESET = "\033[0m" if USE_COLOR else ""
 CLEAR_LINE = "\r\033[K" if USE_COLOR else ""
 
 SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-BARS = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+VOICES = ["Kore", "Fenrir", "Aoede", "Puck", "Charon"]
+
+
+def render_waveform(rms: float) -> str:
+    levels = ["⡀", "⣀", "⣄", "⣤", "⣶", "⣿"]
+    peak = min(len(levels) - 1, max(0, int(rms / 20.0)))
+    c = levels[peak]
+    s1 = levels[max(0, peak - 1)]
+    s2 = levels[max(0, peak - 2)]
+    s3 = levels[max(0, peak - 3)]
+    return f"{s3}{s2}{s1}{c}{s1}{s2}{s3}"
 
 
 class VoicePipeline:
@@ -51,6 +71,16 @@ class VoicePipeline:
         self._force_commit = False
         self._is_speaking = False
         self._awaiting_response = False
+        self._muted = False
+        self._voice_idx = VOICES.index(config.voice_name) if config.voice_name in VOICES else 0
+        self._last_turn_audio: list[bytes] = []
+        self._turn_start_time: float | None = None
+        self._old_termios = None
+        self._history: list[tuple[str, str]] = []
+        self._discard_mic_until: float = 0.0
+        self._has_printed_header = False
+        self._turn_done_event = asyncio.Event()
+        self._turn_done_event.set()
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -70,6 +100,13 @@ class VoicePipeline:
             self.audio_in.start(loop)
             self.audio_out.start()
 
+            if USE_COLOR and _HAS_TERMIOS:
+                try:
+                    self._old_termios = termios.tcgetattr(sys.stdin.fileno())
+                    tty.setcbreak(sys.stdin.fileno())
+                except Exception:
+                    self._old_termios = None
+
             try:
                 loop.add_reader(sys.stdin.fileno(), self._on_stdin_activity)
             except Exception:
@@ -86,31 +123,116 @@ class VoicePipeline:
                     loop.remove_reader(sys.stdin.fileno())
                 except Exception:
                     pass
+                if self._old_termios is not None:
+                    try:
+                        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_termios)
+                    except Exception:
+                        pass
                 await self.stop()
 
     def _on_stdin_activity(self) -> None:
         try:
-            line = sys.stdin.readline()
-            if not line:
+            ch = sys.stdin.read(1)
+            if not ch:
                 return
         except Exception:
             return
 
-        if self.audio_out.is_playing and not self._interrupted:
-            self._interrupted = True
+        if ch == " ":
+            self._discard_mic_until = time.monotonic() + 0.4
+            self._muted = not self._muted
+            if self._muted:
+                if self.audio_out.is_playing:
+                    self.audio_out.flush()
+                if USE_COLOR:
+                    sys.stdout.write(f"{CLEAR_LINE}{RED}[MUTED]{RESET} {DIM}(Space to unmute){RESET}")
+                    sys.stdout.flush()
+            return
+
+        if ch in ("v", "V"):
+            self._discard_mic_until = time.monotonic() + 1.2
+            self._voice_idx = (self._voice_idx + 1) % len(VOICES)
+            next_voice = VOICES[self._voice_idx]
+            asyncio.create_task(self._switch_voice(next_voice))
+            return
+
+        if ch in ("c", "C"):
+            self._discard_mic_until = time.monotonic() + 0.4
             if USE_COLOR:
-                sys.stdout.write(f" {DIM}[interrupted]{RESET}\n")
+                sys.stdout.write("\033[2J\033[H")
+                mode = "Text mode" if self.config.text_mode else "Ready"
+                print(f"{GREEN}●{RESET} Gemini Live ({self.config.voice_name}) · {DIM}{mode} (Ctrl+C to exit){RESET}\n")
+                sys.stdout.flush()
+            return
+
+        if ch in ("r", "R"):
+            self._discard_mic_until = time.monotonic() + 0.4
+            if self._last_turn_audio:
+                if USE_COLOR:
+                    sys.stdout.write(f"{CLEAR_LINE}{DIM}[replaying audio]{RESET}\n")
+                    sys.stdout.flush()
+                for c in self._last_turn_audio:
+                    self.audio_out.play(c)
+            return
+
+        if ch in ("\r", "\n"):
+            self._discard_mic_until = time.monotonic() + 0.4
+            if self.audio_out.is_playing and not self._interrupted:
+                self._interrupted = True
+                if USE_COLOR:
+                    sys.stdout.write(f" {DIM}[interrupted]{RESET}\n")
+                    sys.stdout.flush()
+                else:
+                    print(" [interrupted]")
+                self.audio_out.flush()
+                self._awaiting_response = False
+            elif self._is_speaking:
+                self._force_commit = True
+
+    async def _switch_voice(self, next_voice: str) -> None:
+        try:
+            self._discard_mic_until = time.monotonic() + 1.2
+            if self.audio_out.is_playing:
+                self.audio_out.flush()
+            if self._has_printed_header:
+                if USE_COLOR:
+                    sys.stdout.write(f" {DIM}[switched]{RESET}\n")
+                else:
+                    print(" [switched]")
+                self._has_printed_header = False
+            else:
+                if USE_COLOR and not self.config.text_mode:
+                    sys.stdout.write(CLEAR_LINE)
+            if USE_COLOR:
+                sys.stdout.write(f"● Voice: {next_voice}\n")
                 sys.stdout.flush()
             else:
-                print(" [interrupted]")
-            self.audio_out.flush()
-            self._awaiting_response = False
-        elif self._is_speaking:
-            self._force_commit = True
+                print(f"● Voice: {next_voice}")
+            context_prompt = self._build_context_prompt()
+            await self.client.switch_voice(next_voice, context_prompt)
+            self.config = replace(self.config, voice_name=next_voice)
+            self._turn_done_event.set()
+        except Exception as e:
+            logger.debug("Voice switch error: %s", e)
+            self._turn_done_event.set()
+
+    def _build_context_prompt(self) -> str | None:
+        if not self._history:
+            return None
+        recent = self._history[-6:]
+        lines = [f"{speaker}: {text}" for speaker, text in recent]
+        summary = "\n".join(lines)
+        return f"{self.config.system_instruction}\n\nRecent conversation context:\n{summary}"
 
     async def _text_loop(self) -> None:
         loop = asyncio.get_running_loop()
         while self._running:
+            try:
+                await asyncio.wait_for(self._turn_done_event.wait(), timeout=20.0)
+            except asyncio.TimeoutError:
+                self._turn_done_event.set()
+            if not self._running:
+                break
             try:
                 user_input = await loop.run_in_executor(None, input, f"{GREEN}❯ You:{RESET} ")
             except (EOFError, asyncio.CancelledError):
@@ -130,53 +252,115 @@ class VoicePipeline:
                     self.audio_out.flush()
                 continue
 
+            if user_text.lower() in ("/v", "/voice"):
+                self._voice_idx = (self._voice_idx + 1) % len(VOICES)
+                next_voice = VOICES[self._voice_idx]
+                await self._switch_voice(next_voice)
+                continue
+            elif user_text.lower().startswith(("/v ", "/voice ")):
+                target = user_text.split(None, 1)[1].strip().capitalize()
+                if target in VOICES:
+                    self._voice_idx = VOICES.index(target)
+                    await self._switch_voice(target)
+                else:
+                    print(f"Available voices: {', '.join(VOICES)}")
+                continue
+
             if self.audio_out.is_playing:
                 self._interrupted = True
                 self.audio_out.flush()
 
+            self._turn_done_event.clear()
             self._awaiting_response = True
+            self._turn_start_time = time.monotonic()
+            self._history.append(("User", user_text))
             await self.client.send_text_turn(user_text)
 
     async def _receiver_loop(self) -> None:
-        has_printed_header = False
+        self._has_printed_header = False
+        current_audio: list[bytes] = []
+        accumulated_text: list[str] = []
+        ttfb_ms: int | None = None
+        turn_audio_bytes = 0
+
         while self._running:
             try:
                 audio_chunks, transcripts, interrupted, turn_complete = await self.client.recv()
 
                 if audio_chunks or transcripts or interrupted or turn_complete:
                     self._awaiting_response = False
+                    if ttfb_ms is None and self._turn_start_time is not None:
+                        ttfb_ms = int((time.monotonic() - self._turn_start_time) * 1000)
 
                 if interrupted:
                     self._interrupted = False
                     self.audio_out.flush()
-                    has_printed_header = False
+                    self._has_printed_header = False
+                    current_audio.clear()
+                    accumulated_text.clear()
+                    ttfb_ms = None
+                    turn_audio_bytes = 0
+                    self._turn_done_event.set()
                     continue
 
                 if self._interrupted:
                     if turn_complete:
                         self._interrupted = False
-                        has_printed_header = False
+                        self._has_printed_header = False
+                        current_audio.clear()
+                        accumulated_text.clear()
+                        ttfb_ms = None
+                        turn_audio_bytes = 0
+                        self._turn_done_event.set()
                     continue
 
                 for chunk in audio_chunks:
                     self.audio_out.play(chunk)
+                    current_audio.append(chunk)
+                    turn_audio_bytes += len(chunk)
 
                 for text in transcripts:
-                    if not has_printed_header:
-                        if USE_COLOR:
+                    if not self._has_printed_header:
+                        if USE_COLOR and not self.config.text_mode:
                             sys.stdout.write(CLEAR_LINE)
                         print(f"{CYAN}◆ Gemini:{RESET} ", end="", flush=True)
-                        has_printed_header = True
+                        self._has_printed_header = True
                     print(text, end="", flush=True)
+                    accumulated_text.append(text)
 
                 if turn_complete:
-                    if has_printed_header:
-                        print("\n")
-                    has_printed_header = False
+                    if current_audio:
+                        self._last_turn_audio = list(current_audio)
+                        current_audio.clear()
+
+                    if self._has_printed_header:
+                        if ttfb_ms is not None and turn_audio_bytes > 0:
+                            sec = turn_audio_bytes / (self.config.output_sample_rate * 2)
+                            print(f" {DIM}[{ttfb_ms}ms · {sec:.1f}s audio]{RESET}\n")
+                        else:
+                            print("\n")
+                        if accumulated_text:
+                            self._history.append(("Gemini", "".join(accumulated_text)))
+                    elif turn_audio_bytes > 0:
+                        if USE_COLOR and not self.config.text_mode:
+                            sys.stdout.write(CLEAR_LINE)
+                        sec = turn_audio_bytes / (self.config.output_sample_rate * 2)
+                        lat = f" [{ttfb_ms}ms · {sec:.1f}s audio]" if ttfb_ms else f" [{sec:.1f}s audio]"
+                        print(f"{CYAN}◆ Gemini:{RESET} {DIM}[voice]{lat}{RESET}\n")
+                        self._history.append(("Gemini", "[voice response]"))
+
+                    accumulated_text.clear()
+                    self._has_printed_header = False
+                    ttfb_ms = None
+                    turn_audio_bytes = 0
+                    self._turn_start_time = None
+                    self._turn_done_event.set()
 
             except asyncio.CancelledError:
+                self._turn_done_event.set()
                 break
             except Exception as e:
+                self._turn_done_event.set()
                 if not self._running:
                     break
                 logger.error("Receiver error: %s", e)
@@ -190,7 +374,7 @@ class VoicePipeline:
         speech_chunks = 0
         total_speech_chunks = 0
         barge_in_chunks = 0
-        min_speech_chunks = 2
+        min_speech_chunks = 4
         spin_idx = 0
 
         chunk_ms = (self.config.input_chunk_size / self.config.input_sample_rate) * 1000.0
@@ -204,8 +388,26 @@ class VoicePipeline:
             if not chunk:
                 continue
 
+            if time.monotonic() < self._discard_mic_until:
+                buffer.clear()
+                preroll.clear()
+                is_speaking = False
+                self._is_speaking = False
+                speech_chunks = 0
+                silence_chunks = 0
+                total_speech_chunks = 0
+                continue
+
             spin_idx += 1
             currently_playing = self.audio_out.is_playing
+
+            if self._muted:
+                chunk = bytes(len(chunk))
+                rms = 0.0
+                if USE_COLOR and (spin_idx % 6 == 0):
+                    sys.stdout.write(f"{CLEAR_LINE}{RED}[MUTED]{RESET} {DIM}(Space to unmute){RESET}")
+                    sys.stdout.flush()
+                continue
 
             s = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
             s -= s.mean()
@@ -223,11 +425,10 @@ class VoicePipeline:
                 elif rms < noise_floor * 1.8:
                     noise_floor = 0.998 * noise_floor + 0.002 * rms
 
-                if USE_COLOR and (spin_idx % 4 == 0):
-                    spin = SPINNERS[(spin_idx // 4) % len(SPINNERS)]
-                    level = min(len(BARS) - 1, int(rms / 25.0))
-                    meter = BARS[level] * 3
-                    sys.stdout.write(f"{CLEAR_LINE}{DIM}{spin} Listening... [{meter}]{RESET}")
+                if USE_COLOR and (spin_idx % 3 == 0):
+                    spin = SPINNERS[(spin_idx // 3) % len(SPINNERS)]
+                    wave = render_waveform(rms)
+                    sys.stdout.write(f"{CLEAR_LINE}{DIM}{spin} Listening... {wave}{RESET}")
                     sys.stdout.flush()
 
             is_speech_frame = False
@@ -311,9 +512,8 @@ class VoicePipeline:
                     buffer.extend(chunk)
                     silence_chunks = 0
                     if USE_COLOR and (spin_idx % 2 == 0):
-                        level = min(len(BARS) - 1, int(rms / 20.0))
-                        meter = BARS[level] * 4
-                        sys.stdout.write(f"{CLEAR_LINE}{GREEN}❯ You:{RESET} {DIM}[speaking {meter}]{RESET}")
+                        wave = render_waveform(rms)
+                        sys.stdout.write(f"{CLEAR_LINE}{GREEN}❯ You:{RESET} {wave}")
                         sys.stdout.flush()
             else:
                 if not is_speaking:
@@ -335,12 +535,12 @@ class VoicePipeline:
                         speech_chunks = 0
                         total_speech_chunks = 0
 
-                        if saved_speech < 4 and not force_commit:
+                        if saved_speech < 6 and not force_commit:
                             buffer.clear()
                             continue
 
                         duration_sec = len(buffer) / (self.config.input_sample_rate * 2)
-                        if duration_sec < 0.25 and not force_commit:
+                        if duration_sec < 0.35 and not force_commit:
                             buffer.clear()
                             continue
 
@@ -374,12 +574,15 @@ class VoicePipeline:
                             utterance = raw_pcm
 
                         self._awaiting_response = True
+                        self._turn_start_time = time.monotonic()
+                        self._history.append(("User", "[voice]"))
                         await self.client.send_turn(utterance)
 
     async def stop(self) -> None:
         if not self._running:
             return
         self._running = False
+        self._turn_done_event.set()
         self.audio_in.stop()
         self.audio_out.stop()
         await self.client.close()
