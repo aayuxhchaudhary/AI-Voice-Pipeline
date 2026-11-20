@@ -288,11 +288,11 @@ class VoicePipeline:
                 audio_chunks, transcripts, interrupted, turn_complete = await self.client.recv()
 
                 if audio_chunks or transcripts or interrupted or turn_complete:
-                    self._awaiting_response = False
                     if ttfb_ms is None and self._turn_start_time is not None:
                         ttfb_ms = int((time.monotonic() - self._turn_start_time) * 1000)
 
                 if interrupted:
+                    self._awaiting_response = False
                     self._interrupted = False
                     self.audio_out.flush()
                     self._has_printed_header = False
@@ -305,6 +305,7 @@ class VoicePipeline:
 
                 if self._interrupted:
                     if turn_complete:
+                        self._awaiting_response = False
                         self._interrupted = False
                         self._has_printed_header = False
                         current_audio.clear()
@@ -329,6 +330,7 @@ class VoicePipeline:
                     accumulated_text.append(text)
 
                 if turn_complete:
+                    self._awaiting_response = False
                     if current_audio:
                         self._last_turn_audio = list(current_audio)
                         current_audio.clear()
@@ -419,7 +421,7 @@ class VoicePipeline:
                 preroll.append(chunk)
                 continue
 
-            if not is_speaking and not currently_playing and not self._awaiting_response:
+            if not is_speaking and not currently_playing and not self._awaiting_response and not self._has_printed_header:
                 if rms < noise_floor * 1.3:
                     noise_floor = 0.95 * noise_floor + 0.05 * rms
                 elif rms < noise_floor * 1.8:
@@ -467,7 +469,7 @@ class VoicePipeline:
 
                 if has_speech and rms > barge_thresh:
                     barge_in_chunks += 1
-                    if barge_in_chunks >= 3 and not self._interrupted:
+                    if barge_in_chunks >= 6 and not self._interrupted:
                         self._interrupted = True
                         if USE_COLOR:
                             sys.stdout.write(f" {DIM}[interrupted]{RESET}\n")
